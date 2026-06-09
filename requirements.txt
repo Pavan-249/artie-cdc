@@ -1,0 +1,5 @@
+streamlit
+streamlit-autorefresh
+psycopg2-binary
+clickhouse-connect
+pandas

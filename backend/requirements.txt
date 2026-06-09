@@ -1,0 +1,5 @@
+fastapi[standard]
+uvicorn[standard]
+psycopg2-binary
+clickhouse-connect
+sse-starlette
