@@ -3,12 +3,12 @@ services:
     build: ./postgres
     container_name: artie_pg
     environment:
-      POSTGRES_DB: demo
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-demo}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       TZ: UTC
       PGTZ: UTC
-    command:                      # wal_level=logical = what enables log-based CDC
+    command:
       - "postgres"
       - "-c"
       - "wal_level=logical"
@@ -17,11 +17,11 @@ services:
       - "-c"
       - "max_replication_slots=4"
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-demo}"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -30,13 +30,13 @@ services:
     image: clickhouse/clickhouse-server:latest
     container_name: artie_ch
     environment:
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     ports:
-      - "8123:8123"   # HTTP (used by clickhouse-connect)
-      - "9000:9000"   # native
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
     volumes:
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:

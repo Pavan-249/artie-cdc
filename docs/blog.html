@@ -1,0 +1,127 @@
+<!doctype html><html><head><meta charset='utf-8'><style>
+body{max-width:820px;margin:40px auto;padding:0 24px;font:16px/1.7 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1f2328;background:#fff}
+h1{font-size:2rem;line-height:1.25;border-bottom:1px solid #d8dee4;padding-bottom:.3em;margin-top:1.2em}
+h2{font-size:1.5rem;border-bottom:1px solid #eaecef;padding-bottom:.3em;margin-top:1.8em}
+h3{font-size:1.15rem;margin-top:1.4em}
+p{margin:.8em 0}
+img{max-width:100%;border:1px solid #d8dee4;border-radius:8px;margin:1em 0;display:block}
+code{background:#f3f4f6;padding:.15em .35em;border-radius:4px;font-size:.88em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+pre{background:#0d1117;color:#e6edf3;padding:16px;border-radius:8px;overflow:auto;font-size:.85rem}
+pre code{background:transparent;color:inherit;padding:0}
+ul,ol{margin:.6em 0;padding-left:1.6em}
+li{margin:.25em 0}
+</style></head><body><h1>From trade booking to analytics in seconds: a local Postgres to ClickHouse CDC demo</h1>
+<p>A serious change data capture (CDC) demo does not need hosted infrastructure. A local stack can still show the core production pattern: trades are booked in Postgres, streamed off the write ahead log, materialized into ClickHouse, and watched through a control room dashboard. This post walks through a small but complete version of that pipeline, built for a trade surveillance use case, and explains how each piece works.</p>
+<p>Everything here runs on one machine with Docker, Python, and Streamlit. The data is deterministic, so anyone can reproduce the same result.</p>
+<p><img alt="Trade surveillance dashboard, dark mode" src="../screenshots/01-dashboard-dark.png" /></p>
+<h2>Why low latency replication matters in finance operations</h2>
+<p>Trading systems book orders into a transactional database that is tuned for correctness and concurrency, not for analytics. Postgres is a common choice for that system of record. The moment a trade is booked, several other teams want to see it: risk wants the updated exposure, surveillance wants to scan for suspicious patterns, and operations wants to confirm the booking settled cleanly.</p>
+<p>Running those analytical queries directly against the trading database is a bad idea. The scans compete with live booking traffic, and the row oriented storage is slow for the wide aggregations that surveillance needs. The standard answer is to replicate the data into an analytical store such as ClickHouse, and to keep that copy fresh with CDC instead of slow batch exports. The faster the replication, the sooner an analyst can act on a flagged trade.</p>
+<h2>The use case: trade surveillance</h2>
+<p>The demo models a surveillance control room. The source of truth is a <code>trades</code> table that holds institutional orders across equities, rates, credit, FX, and ETFs. Each trade carries operational fields that a surveillance team actually looks at:</p>
+<ul>
+<li>desk, trader, client, and venue</li>
+<li>symbol, asset class, and side</li>
+<li>quantity, price, and notional in USD</li>
+<li>a risk score from 0 to 100</li>
+<li>a status: BOOKED, REVIEW, APPROVED, BLOCKED, or CANCELLED</li>
+</ul>
+<p>The dashboard then tracks the things a reviewer cares about: how many rows exist on each side, total open notional, the count of exceptions in REVIEW or BLOCKED, the number of high risk trades, and the average risk score. It also shows notional by desk and average risk by desk, so a spike is easy to spot.</p>
+<h2>The architecture</h2>
+<p>The flow is a straight line from the source table to the dashboard, with one important loop: the dashboard only ever writes to Postgres. It never writes to ClickHouse.</p>
+<p><img alt="Architecture: Postgres to ClickHouse CDC" src="diagrams/architecture.png" /></p>
+<p>The pieces:</p>
+<ol>
+<li><strong>Postgres</strong> holds the <code>trades</code> table and emits logical replication events.</li>
+<li><strong>Logical WAL with wal2json</strong> turns each committed change into a JSON record.</li>
+<li><strong>A Python CDC worker</strong> reads that stream and writes version rows into ClickHouse.</li>
+<li><strong>ClickHouse</strong> stores every version and resolves the latest state at query time.</li>
+<li><strong>A Streamlit dashboard</strong> reads from both stores and drives changes into Postgres only.</li>
+</ol>
+<h2>How the CDC actually works</h2>
+<h3>Postgres side</h3>
+<p>The source table is ordinary, with one extra setting:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">trades</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="k">IDENTITY</span><span class="w"> </span><span class="k">FULL</span><span class="p">;</span>
+</code></pre></div>
+
+<p><code>REPLICA IDENTITY FULL</code> makes Postgres include the full previous row image in update and delete events, not just the primary key. That matters for a faithful replica, because the worker can apply deletes and updates with complete context.</p>
+<p>The worker creates a logical replication slot that uses the <code>wal2json</code> output plugin:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">cur</span><span class="o">.</span><span class="n">create_replication_slot</span><span class="p">(</span><span class="n">SLOT_NAME</span><span class="p">,</span> <span class="n">output_plugin</span><span class="o">=</span><span class="s2">&quot;wal2json&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p>A replication slot is Postgres remembering a reader position in the write ahead log. As long as the slot exists, Postgres retains the WAL the worker has not consumed yet, so no change is lost if the worker restarts.</p>
+<h3>The worker</h3>
+<p>The worker runs in two phases.</p>
+<p><img alt="The CDC worker runs in two phases" src="diagrams/two-phase-worker.png" /></p>
+<p>First it does a <strong>snapshot backfill</strong>: it reads the current <code>trades</code> table and inserts each row into ClickHouse tagged with the operation <code>SNAPSHOT</code>. This gives ClickHouse a complete starting state.</p>
+<p>Then it <strong>streams</strong>: it starts logical replication on the slot and decodes each <code>wal2json</code> message. For every insert, update, or delete it appends a new version row to ClickHouse, never updating in place. Each version carries three bookkeeping columns:</p>
+<ul>
+<li><code>__cdc_operation</code>: SNAPSHOT, INSERT, UPDATE, or DELETE</li>
+<li><code>__cdc_is_deleted</code>: 0 for live rows, 1 for tombstones</li>
+<li><code>__cdc_updated_at</code>: the version timestamp used to pick the winner</li>
+</ul>
+<p>The worker also appends every event to a local <code>cdc_events.jsonl</code> log with a measured <code>lag_ms</code>, which is what the dashboard uses for the latest events panel and the lag readout.</p>
+<h3>ClickHouse side</h3>
+<p>ClickHouse never mutates rows in place either. The table uses the <code>ReplacingMergeTree</code> engine:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">default</span><span class="p">.</span><span class="n">trades</span><span class="w"> </span><span class="p">(</span>
+<span class="w">  </span><span class="p">...</span>
+<span class="w">  </span><span class="n">__cdc_operation</span><span class="w"> </span><span class="n">String</span><span class="p">,</span>
+<span class="w">  </span><span class="n">__cdc_is_deleted</span><span class="w"> </span><span class="n">UInt8</span><span class="p">,</span>
+<span class="w">  </span><span class="n">__cdc_updated_at</span><span class="w"> </span><span class="n">DateTime64</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;UTC&#39;</span><span class="p">)</span>
+<span class="p">)</span>
+<span class="n">ENGINE</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ReplacingMergeTree</span><span class="p">(</span><span class="n">__cdc_updated_at</span><span class="p">)</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">trade_id</span><span class="p">;</span>
+</code></pre></div>
+
+<p><code>ReplacingMergeTree(__cdc_updated_at)</code> means: for rows that share the same sort key (<code>trade_id</code>), keep only the one with the highest <code>__cdc_updated_at</code>. Background merges eventually collapse old versions, and a query can force that collapse immediately with the <code>FINAL</code> keyword. Deletes are handled as tombstones, so the read query filters them out:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">trades</span><span class="w"> </span><span class="k">FINAL</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">__cdc_is_deleted</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">trade_id</span><span class="p">;</span>
+</code></pre></div>
+
+<p>This append plus <code>ReplacingMergeTree</code> plus <code>FINAL</code> pattern is how you get update and delete semantics on a store that is built for high speed appends.</p>
+<p><img alt="Version row lifecycle under FINAL" src="diagrams/version-lifecycle.png" /></p>
+<h2>The dashboard, end to end</h2>
+<p>The dashboard is the demo surface. It is intentionally compact so the whole story fits on one screen.</p>
+<p>You pick one source change, preview its SQL, and only then run it. The SQL preview is read only until you click Run, which keeps the demo honest: nothing touches the database until you ask.</p>
+<p><img alt="Source change selected with its SQL previewed" src="../screenshots/02-sql-preview-selected.png" /></p>
+<p>The two panes below are live read only <code>SELECT</code> results from each store, shown side by side. They are not a database console. The captions under each pane show the exact query, which makes the point that the dashboard reads ClickHouse rather than editing it.</p>
+<p>When you run a change, you watch it travel. The screenshot below was taken right after running the MSFT price correction. The same <code>trade_id</code> is highlighted on both sides, and the destination pane shows <code>__cdc_operation = UPDATE</code>, which means the worker read the Postgres change and appended a new version that <code>FINAL</code> resolved to the latest state. The KPIs and the desk charts move at the same time.</p>
+<p><img alt="A change propagating from Postgres to ClickHouse" src="../screenshots/03-after-run-cdc.png" /></p>
+<p>The whole UI also has a light mode, for screen sharing in a bright room.</p>
+<p><img alt="Trade surveillance dashboard, light mode" src="../screenshots/04-dashboard-light.png" /></p>
+<p>A second tab keeps the supporting detail close: status distribution, notional by asset class, and the most recent CDC events with their operation and risk.</p>
+<p><img alt="Analytics and recent CDC events" src="../screenshots/05-analytics-events.png" /></p>
+<h2>The demo scenarios</h2>
+<p>Every button maps to one SQL statement against Postgres, chosen so that at least one KPI or chart visibly moves once CDC applies it:</p>
+<ul>
+<li><strong>Add JPM trade (INSERT)</strong>: a new equity booking appears in both tables.</li>
+<li><strong>Flag NVDA risk (UPDATE)</strong>: raises the risk score and moves the trade to REVIEW, so the exception count and the risk chart change.</li>
+<li><strong>Approve US10Y review (UPDATE)</strong>: clears a review item, so the exception count drops.</li>
+<li><strong>Correct MSFT price (UPDATE)</strong>: a small price correction that nudges notional.</li>
+<li><strong>Cancel SOFR duplicate (UPDATE)</strong>: cancels a duplicate booking.</li>
+<li><strong>Delete bad credit booking (DELETE)</strong>: removes an erroneous trade, which arrives in ClickHouse as a tombstone and disappears from the FINAL view.</li>
+</ul>
+<p>Because the dataset is deterministic, a Reload baseline button resets both stores to the same starting point, so the demo is repeatable.</p>
+<h2>What a production version would add</h2>
+<p>This is a local project, not a platform. The local design keeps the moving parts visible, which is the point. A production build would add the things that a single machine demo can skip:</p>
+<ul>
+<li>schema governance and compatibility checks as the source table evolves</li>
+<li>retries, backpressure, and dead letter handling in the worker</li>
+<li>replay controls and slot monitoring so a stuck consumer is caught early</li>
+<li>access controls on both stores and on the dashboard</li>
+<li>lineage and alerting so an analyst trusts what the numbers mean</li>
+<li>operational runbooks for failover and reseeding</li>
+</ul>
+<p>None of that changes the core mechanic shown here. It hardens it.</p>
+<h2>Run it yourself</h2>
+<div class="codehilite"><pre><span></span><code>scripts/start_databases.sh
+python<span class="w"> </span>scripts/ingest_finance_data.py
+python<span class="w"> </span>cdc_pipeline.py
+streamlit<span class="w"> </span>run<span class="w"> </span>dashboard.py
+</code></pre></div>
+
+<p>The dashboard runs at <code>http://localhost:8501</code>. Pick a source change, preview the SQL, run it, and watch the change land in ClickHouse.</p>
+<h2>Closing</h2>
+<p>The takeaway is simple. You can demonstrate the real CDC pattern, write side correctness and read side freshness, with nothing more than Postgres, a logical replication slot, a small Python worker, and ClickHouse. Once you can see a single trade move from the source commit to the analytical view in seconds, the production version is mostly a matter of hardening, not new ideas.</p></body></html>

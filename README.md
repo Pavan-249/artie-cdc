@@ -1,198 +1,172 @@
-# CDC Pipeline Demo — Postgres → ClickHouse
+# Trade Surveillance CDC Demo
 
-A real-time Change Data Capture (CDC) pipeline that replicates data from Postgres to ClickHouse using logical replication (WAL + wal2json). No mocks, no replays — real CDC.
+A local, reproducible Change Data Capture demo for a finance operations use case. Postgres acts as the trade booking system, a Python worker reads logical replication events through `wal2json`, and ClickHouse serves the analytical replica used by the dashboard.
+
+No hosted deployment is included.
+
+## Use Case
+
+The demo models institutional trade surveillance. Users can add a new trade, flag a risky trade, approve a reviewed trade, correct a trade price, cancel a duplicate, or delete an erroneous booking. Selecting an action previews the mapped SQL without mutating data. Clicking `Run selected SQL` writes to Postgres, then CDC carries the change into ClickHouse.
 
 ## Architecture
 
-```
-┌─────────────────────┐       ┌────────────────────────────────────┐
-│   Vercel            │       │   Railway                          │
-│                     │       │                                    │
-│   Next.js Frontend  │◄─────►│   FastAPI Backend                  │
-│   (Tailwind CSS)    │  API  │     ├── REST endpoints             │
-│                     │       │     ├── SSE /events/stream          │
-│                     │       │     └── CDC Worker (background)    │
-└─────────────────────┘       │                                    │
-                              │   Railway Postgres                 │
-                              │     └── wal_level=logical          │
-                              └───────────┬────────────────────────┘
-                              ┌───────────┴───────────┐
-                              │   ClickHouse Cloud     │
-                              └───────────────────────┘
+```mermaid
+flowchart LR
+  A["Postgres trades table"] --> B["Logical WAL stream"]
+  B --> C["wal2json replication slot"]
+  C --> D["Python CDC worker"]
+  D --> E["ClickHouse trades table"]
+  E --> F["Trade surveillance dashboard"]
+  F --> A
 ```
 
-## Quick Start (Local Docker)
+## Reproducible Run
 
-The original local demo still works with Docker Compose:
+Create a virtual environment and install dependencies:
 
 ```bash
-docker compose up -d
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-python cdc_pipeline.py &
-streamlit run dashboard.py
 ```
 
----
+Start Postgres and ClickHouse:
 
-## Hosted MVP Deployment
-
-### Prerequisites
-
-- [Railway](https://railway.app) account
-- [Vercel](https://vercel.com) account
-- [ClickHouse Cloud](https://clickhouse.com/cloud) account (free tier works)
-
----
-
-### 1. ClickHouse Cloud Setup
-
-1. Sign up at [clickhouse.com/cloud](https://clickhouse.com/cloud)
-2. Create a new service (free tier is fine)
-3. Note your connection details:
-   - **Host**: e.g., `abc123.us-east-1.aws.clickhouse.cloud`
-   - **Port**: `8443` (HTTPS)
-   - **User**: `default`
-   - **Password**: (the one you set)
-4. The backend will automatically create the `orders` table on first startup
-
----
-
-### 2. Railway Backend Setup
-
-1. **Create a new project** on [Railway](https://railway.app)
-
-2. **Add a Postgres addon**:
-   - Click "New" → "Database" → "Postgres"
-   - Railway provisions a managed Postgres instance
-
-3. **Enable logical replication** on Railway Postgres:
-   ```sql
-   -- Connect via Railway's psql or Data tab
-   ALTER SYSTEM SET wal_level = 'logical';
-   ALTER SYSTEM SET max_wal_senders = '4';
-   ALTER SYSTEM SET max_replication_slots = '4';
-   ```
-   Then **restart** the Postgres service from Railway dashboard.
-
-   > **Note**: Verify with `SHOW wal_level;` — it must return `logical`.
-
-4. **Deploy the backend**:
-   - Click "New" → "GitHub Repo" (or deploy from CLI)
-   - Set the **root directory** to `backend/`
-   - Or use Railway CLI:
-     ```bash
-     cd backend
-     railway link
-     railway up
-     ```
-
-5. **Set environment variables** on the backend service:
-   ```
-   DATABASE_URL=<Railway Postgres connection string>
-   CH_HOST=<your ClickHouse Cloud host>
-   CH_PORT=8443
-   CH_USER=default
-   CH_PASSWORD=<your ClickHouse password>
-   CH_SECURE=true
-   CH_DATABASE=default
-   SLOT_NAME=cdc_artie_slot
-   FRONTEND_URL=https://your-app.vercel.app
-   ```
-
-   > Railway auto-injects `DATABASE_URL` if you link the Postgres addon to the backend service. You can reference it as `${{Postgres.DATABASE_URL}}`.
-
-6. **Verify**: Visit `https://your-backend.railway.app/health`
-
----
-
-### 3. Vercel Frontend Setup
-
-1. **Import the repo** on [Vercel](https://vercel.com/new)
-
-2. **Configure**:
-   - Set **Root Directory** to `frontend/`
-   - Framework Preset: **Next.js** (auto-detected)
-
-3. **Set environment variables**:
-   ```
-   NEXT_PUBLIC_API_URL=https://your-backend.railway.app
-   ```
-
-4. **Deploy** — Vercel will build and deploy automatically
-
-5. **Verify**: Visit your Vercel URL — the dashboard should load
-
----
-
-### 4. Post-Deployment
-
-1. Open the dashboard on Vercel
-2. Click **"Reset Demo"** to seed initial data and start the CDC pipeline
-3. Click **"Insert Order"** — watch the row appear in Postgres, then replicate to ClickHouse
-4. Click **"Update Order"** — see the change propagate
-5. Click **"Delete Order"** — verify removal from both views
-6. Watch the **Live Change Feed** and **SQL Fired** panels update in real-time
-
----
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check with DB connectivity |
-| `GET` | `/metrics` | KPI metrics (events, latency, sync status) |
-| `GET` | `/orders/source` | Postgres orders table |
-| `GET` | `/orders/clickhouse` | ClickHouse orders table |
-| `POST` | `/orders/insert` | Insert order into Postgres |
-| `POST` | `/orders/update` | Update order in Postgres |
-| `POST` | `/orders/delete` | Delete order from Postgres |
-| `POST` | `/reset` | Reset demo (truncate + reseed + restart CDC) |
-| `GET` | `/events/stream` | SSE stream of CDC events |
-
-## CDC Event Shape
-
-```json
-{
-  "op": "INSERT",
-  "table": "orders",
-  "pk": 123,
-  "before": {},
-  "after": { "id": 123, "customer_name": "Ada Lovelace", ... },
-  "diff": {},
-  "commit_ts": "2026-06-08T21:48:53.635733+00:00",
-  "apply_ts": "2026-06-08T21:48:53.638910+00:00",
-  "lag_ms": 3.177,
-  "sql_fired": "INSERT INTO orders (...) VALUES (...)"
-}
+```bash
+scripts/start_databases.sh
 ```
+
+In a second terminal, load the deterministic finance dataset:
+
+```bash
+python scripts/setup_databases.py
+python scripts/ingest_finance_data.py
+```
+
+In a third terminal, start the CDC worker:
+
+```bash
+scripts/run_cdc_worker.sh
+```
+
+In a fourth terminal, open the dashboard:
+
+```bash
+scripts/run_dashboard.sh
+```
+
+The dashboard normally opens at `http://localhost:8501`.
+
+## What To Click
+
+The dashboard includes 6 scenario buttons:
+
+| Scenario | What it demonstrates |
+| --- | --- |
+| Add JPM trade | Inserts a new equity booking. |
+| Flag NVDA risk | Updates one trade into review and raises risk score. |
+| Approve US10Y review | Clears a reviewed rates trade. |
+| Correct MSFT price | Applies a small price and notional correction. |
+| Cancel SOFR duplicate | Cancels a duplicate trade while preserving history. |
+| Delete bad credit booking | Deletes an erroneous trade and emits a CDC tombstone. |
+
+Click a scenario to preview SQL. Then click `Run selected SQL` to execute it against Postgres. The dashboard embeds live read-only query panes for Postgres and ClickHouse so the source and destination states are visible side by side. KPIs, charts, and the CDC event feed refresh automatically after the worker applies the change.
 
 ## Project Structure
 
-```
+```text
 cdc-artie-demo/
-├── backend/              # FastAPI + CDC worker (Railway)
-│   ├── main.py           # FastAPI app with all endpoints
-│   ├── cdc_worker.py     # Real CDC worker (WAL → ClickHouse)
-│   ├── db.py             # Database connection helpers
-│   ├── config.py         # Environment-based configuration
-│   ├── Dockerfile        # Railway deployment
-│   ├── railway.toml      # Railway config
-│   └── requirements.txt
-├── frontend/             # Next.js dashboard (Vercel)
-│   ├── src/
-│   │   ├── app/          # Next.js App Router
-│   │   ├── components/   # Dashboard components
-│   │   └── lib/          # API client + types
-│   └── .env.example
-├── docker-compose.yml    # Local Docker demo (unchanged)
-├── cdc_pipeline.py       # Local CDC worker (unchanged)
-├── dashboard.py          # Local Streamlit dashboard (unchanged)
-└── README.md
+|-- clickhouse/
+|   `-- init.sql                 # ClickHouse trades table
+|-- data/
+|   `-- trades_seed.csv          # Versioned deterministic dataset
+|-- docs/
+|   |-- architecture.mmd         # Mermaid architecture diagram
+|   `-- blog-draft.md            # Blog outline and draft
+|-- postgres/
+|   |-- Dockerfile               # Postgres with wal2json installed
+|   `-- init.sql                 # Postgres trades table
+|-- scripts/
+|   |-- ingest_finance_data.py   # Deterministic baseline loader
+|   |-- reset_demo.py            # Same baseline reload entry point
+|   |-- run_cdc_worker.sh        # Starts the worker
+|   |-- run_dashboard.sh         # Starts Streamlit
+|   |-- setup_clickhouse.py      # Ensures ClickHouse schema
+|   |-- setup_databases.py       # Ensures both schemas
+|   |-- setup_postgres.py        # Ensures Postgres schema
+|   `-- start_databases.sh       # Starts Docker Compose
+|-- screenshots/
+|   `-- .gitkeep                 # Place dashboard screenshots here
+|-- .env.example                 # Local environment reference
+|-- docker-compose.yml           # Local Postgres and ClickHouse stack
+|-- cdc_pipeline.py              # CDC worker
+|-- dashboard.py                 # Streamlit control-room dashboard
+|-- finance_actions.py           # Mapped SQL demo actions
+`-- requirements.txt             # Python dependencies
 ```
 
-## Important Notes
+## Data Model
 
-- **No mocks or replays** — all CDC is real Postgres logical replication
-- **Actions write to Postgres only** — the CDC worker picks up changes from WAL and applies them to ClickHouse
-- **SSE for real-time updates** — the dashboard receives events as they happen
-- **Existing local demo is untouched** — all hosted code lives in `backend/` and `frontend/`
+The reproducible baseline lives in `data/trades_seed.csv`. The source table is `trades`. It includes:
+
+- Trade identity and timestamps: `trade_id`, `trade_ts`, `updated_at`
+- Client and ownership fields: `account_id`, `client_name`, `desk`, `trader`
+- Instrument fields: `symbol`, `asset_class`, `side`, `venue`
+- Economic fields: `quantity`, `price`, `notional_usd`
+- Control fields: `risk_score`, `status`
+
+ClickHouse stores the same trade fields plus CDC metadata:
+
+- `__cdc_operation`
+- `__cdc_is_deleted`
+- `__cdc_updated_at`
+
+The ClickHouse table uses `ReplacingMergeTree(__cdc_updated_at)` with `ORDER BY trade_id`. Dashboard queries use `FINAL` and filter `__cdc_is_deleted = 0` for the live analytical state.
+
+## Dashboard Accuracy
+
+The dashboard computes KPIs from the ClickHouse replica so changes appear only after CDC applies them:
+
+- Source trades
+- Replica trades
+- Open notional
+- Exceptions
+- High-risk trades
+- Average risk score
+- Notional by desk
+- Trade status distribution
+- Recent CDC events
+- Exception queue
+
+The source and replica tabs are shown side by side in the same interface so row-level CDC behavior is easy to verify.
+
+## Environment
+
+The app works with built-in local defaults. Copy `.env.example` to `.env` only if you want to override ports, connection strings, or local demo credentials.
+
+`.env`, local event logs, Python caches, and generated dependency folders are ignored by Git.
+
+## Resetting The Demo
+
+Reload the deterministic baseline:
+
+```bash
+python scripts/ingest_finance_data.py
+```
+
+For a full container reset:
+
+```bash
+docker compose down
+docker compose up
+python scripts/ingest_finance_data.py
+```
+
+## Screenshots
+
+Put blog screenshots in `screenshots/`. Recommended captures:
+
+- Dashboard immediately after baseline load and worker backfill.
+- SQL panel after a scenario click.
+- Notional by desk and exception queue after several changes.
+- CDC event feed after insert, update, and delete examples.

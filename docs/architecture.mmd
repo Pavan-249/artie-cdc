@@ -1,0 +1,7 @@
+flowchart LR
+  A["Postgres trades table"] --> B["Logical WAL stream"]
+  B --> C["wal2json replication slot"]
+  C --> D["Python CDC worker"]
+  D --> E["ClickHouse trades table"]
+  E --> F["Trade surveillance dashboard"]
+  F --> A

@@ -11,6 +11,44 @@ import psycopg2
 from psycopg2.extras import LogicalReplicationConnection
 
 
+TABLE_NAME = "trades"
+SOURCE_COLUMNS = [
+    "trade_id",
+    "trade_ts",
+    "account_id",
+    "client_name",
+    "desk",
+    "trader",
+    "symbol",
+    "asset_class",
+    "side",
+    "quantity",
+    "price",
+    "notional_usd",
+    "venue",
+    "risk_score",
+    "status",
+    "updated_at",
+]
+DECIMAL_COLUMNS = {"quantity", "price", "notional_usd"}
+TIMESTAMP_COLUMNS = {"trade_ts", "updated_at"}
+
+
+def load_env_file(path=".env"):
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+load_env_file()
+
+
 PG_DSN = os.getenv("PG_DSN", "host=localhost port=5432 dbname=demo user=postgres password=postgres")
 PG_REPL_DSN = os.getenv(
     "PG_REPL_DSN",
@@ -20,10 +58,8 @@ CH_HOST = os.getenv("CH_HOST", "localhost")
 CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASSWORD = os.getenv("CH_PASSWORD", "clickhouse")
-SLOT_NAME = os.getenv("SLOT_NAME", "mini_artie_slot")
+SLOT_NAME = os.getenv("SLOT_NAME", "finance_cdc_slot")
 EVENT_LOG = Path(os.getenv("EVENT_LOG", "cdc_events.jsonl"))
-
-ORDER_COLUMNS = ["id", "customer_name", "product", "amount", "status", "created_at"]
 
 
 def utc_now():
@@ -36,6 +72,16 @@ def json_default(value):
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
+
+
+def parse_datetime(value):
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def wait_for_postgres(timeout=90):
@@ -72,19 +118,29 @@ def wait_for_clickhouse(timeout=90):
 def ensure_schema(client):
     client.command(
         """
-        CREATE TABLE IF NOT EXISTS default.orders (
-          id Int64,
-          customer_name String,
-          product String,
-          amount Decimal(12, 2),
+        CREATE TABLE IF NOT EXISTS default.trades (
+          trade_id Int64,
+          trade_ts DateTime64(6, 'UTC'),
+          account_id String,
+          client_name String,
+          desk String,
+          trader String,
+          symbol String,
+          asset_class String,
+          side String,
+          quantity Decimal(18, 4),
+          price Decimal(18, 4),
+          notional_usd Decimal(18, 2),
+          venue String,
+          risk_score Int32,
           status String,
-          created_at DateTime64(6, 'UTC'),
-          __artie_operation String,
-          __artie_delete UInt8,
-          __artie_updated_at DateTime64(6, 'UTC')
+          updated_at DateTime64(6, 'UTC'),
+          __cdc_operation String,
+          __cdc_is_deleted UInt8,
+          __cdc_updated_at DateTime64(6, 'UTC')
         )
-        ENGINE = ReplacingMergeTree(__artie_updated_at)
-        ORDER BY id
+        ENGINE = ReplacingMergeTree(__cdc_updated_at)
+        ORDER BY trade_id
         """
     )
 
@@ -105,10 +161,12 @@ def ensure_slot():
 
 def normalize_row(row):
     normalized = dict(row)
-    if isinstance(normalized.get("created_at"), str):
-        normalized["created_at"] = datetime.fromisoformat(normalized["created_at"].replace("Z", "+00:00"))
-    if isinstance(normalized.get("created_at"), datetime) and normalized["created_at"].tzinfo is None:
-        normalized["created_at"] = normalized["created_at"].replace(tzinfo=timezone.utc)
+    for column in TIMESTAMP_COLUMNS:
+        normalized[column] = parse_datetime(normalized[column])
+    for column in DECIMAL_COLUMNS:
+        normalized[column] = Decimal(str(normalized[column]))
+    normalized["trade_id"] = int(normalized["trade_id"])
+    normalized["risk_score"] = int(normalized["risk_score"])
     return normalized
 
 
@@ -120,30 +178,35 @@ def insert_versions(client, rows, operation, deleted, version_ts):
         item = normalize_row(row)
         payload.append(
             [
-                int(item["id"]),
-                item.get("customer_name") or "",
-                item.get("product") or "",
-                Decimal(str(item.get("amount") or "0")),
-                item.get("status") or "",
-                item["created_at"],
+                item["trade_id"],
+                item["trade_ts"],
+                item["account_id"],
+                item["client_name"],
+                item["desk"],
+                item["trader"],
+                item["symbol"],
+                item["asset_class"],
+                item["side"],
+                item["quantity"],
+                item["price"],
+                item["notional_usd"],
+                item["venue"],
+                item["risk_score"],
+                item["status"],
+                item["updated_at"],
                 operation,
                 int(deleted),
                 version_ts,
             ]
         )
     client.insert(
-        "orders",
+        TABLE_NAME,
         payload,
         column_names=[
-            "id",
-            "customer_name",
-            "product",
-            "amount",
-            "status",
-            "created_at",
-            "__artie_operation",
-            "__artie_delete",
-            "__artie_updated_at",
+            *SOURCE_COLUMNS,
+            "__cdc_operation",
+            "__cdc_is_deleted",
+            "__cdc_updated_at",
         ],
     )
 
@@ -151,11 +214,19 @@ def insert_versions(client, rows, operation, deleted, version_ts):
 def backfill(client):
     with psycopg2.connect(PG_DSN) as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, customer_name, product, amount, status, created_at FROM orders ORDER BY id")
-            rows = [dict(zip(ORDER_COLUMNS, record)) for record in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT trade_id, trade_ts, account_id, client_name, desk, trader,
+                       symbol, asset_class, side, quantity, price, notional_usd,
+                       venue, risk_score, status, updated_at
+                FROM trades
+                ORDER BY trade_id
+                """
+            )
+            rows = [dict(zip(SOURCE_COLUMNS, record)) for record in cur.fetchall()]
     version_ts = utc_now()
     insert_versions(client, rows, "SNAPSHOT", 0, version_ts)
-    print(f"Backfilled {len(rows)} rows", flush=True)
+    print(f"Backfilled {len(rows)} trades", flush=True)
 
 
 def column_dict(container):
@@ -179,10 +250,7 @@ def parse_commit_ts(payload):
     if not raw:
         return utc_now()
     try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
+        return parse_datetime(raw)
     except ValueError:
         return utc_now()
 
@@ -199,25 +267,25 @@ def apply_message(client, msg, payload):
     changes = payload.get("change", [])
 
     for change in changes:
-        if change.get("table") != "orders":
+        if change.get("table") != TABLE_NAME:
             continue
         kind = change["kind"]
         row = changed_row(change)
         deleted = 1 if kind == "delete" else 0
-        op = kind.upper()
-        insert_versions(client, [row], op, deleted, apply_ts)
+        operation = kind.upper()
+        insert_versions(client, [row], operation, deleted, apply_ts)
         append_event(
             {
                 "lsn": msg.data_start,
                 "commit_timestamp": commit_ts,
                 "applied_at": apply_ts,
                 "lag_ms": round(lag_ms, 3),
-                "operation": op,
-                "id": row.get("id"),
+                "operation": operation,
+                "trade_id": row.get("trade_id"),
                 "row": row,
             }
         )
-        print(f"{op:6} id={row.get('id')} lag_ms={lag_ms:.1f}", flush=True)
+        print(f"{operation:6} trade_id={row.get('trade_id')} lag_ms={lag_ms:.1f}", flush=True)
 
     msg.cursor.send_feedback(flush_lsn=msg.data_start)
 
@@ -252,7 +320,7 @@ def stream_changes(client):
 
 
 def main():
-    print("mini-Artie CDC pipeline starting", flush=True)
+    print("Finance CDC worker starting", flush=True)
     wait_for_postgres()
     client = wait_for_clickhouse()
     ensure_schema(client)
@@ -265,5 +333,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nCDC pipeline stopped", flush=True)
+        print("\nCDC worker stopped", flush=True)
         sys.exit(0)

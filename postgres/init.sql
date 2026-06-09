@@ -1,18 +1,20 @@
-CREATE TABLE IF NOT EXISTS orders (
-  id BIGSERIAL PRIMARY KEY,
-  customer_name TEXT NOT NULL,
-  product TEXT NOT NULL,
-  amount NUMERIC(12, 2) NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS trades (
+  trade_id BIGINT PRIMARY KEY,
+  trade_ts TIMESTAMPTZ NOT NULL,
+  account_id TEXT NOT NULL,
+  client_name TEXT NOT NULL,
+  desk TEXT NOT NULL,
+  trader TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  asset_class TEXT NOT NULL,
+  side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+  quantity NUMERIC(18, 4) NOT NULL,
+  price NUMERIC(18, 4) NOT NULL,
+  notional_usd NUMERIC(18, 2) NOT NULL,
+  venue TEXT NOT NULL,
+  risk_score INTEGER NOT NULL CHECK (risk_score BETWEEN 0 AND 100),
+  status TEXT NOT NULL CHECK (status IN ('BOOKED', 'REVIEW', 'APPROVED', 'BLOCKED', 'CANCELLED')),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-ALTER TABLE orders REPLICA IDENTITY FULL;
-
-INSERT INTO orders (customer_name, product, amount, status, created_at)
-VALUES
-  ('Ada Lovelace', 'Keyboard', 149.99, 'paid', now() - interval '12 minutes'),
-  ('Grace Hopper', 'Monitor', 329.50, 'shipped', now() - interval '9 minutes'),
-  ('Katherine Johnson', 'Desk lamp', 41.25, 'pending', now() - interval '6 minutes'),
-  ('Margaret Hamilton', 'Dock', 119.00, 'paid', now() - interval '3 minutes')
-ON CONFLICT DO NOTHING;
+ALTER TABLE trades REPLICA IDENTITY FULL;

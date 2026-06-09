@@ -7,9 +7,9 @@ venv/
 env/
 
 # Node
-frontend/node_modules/
-frontend/.next/
-frontend/out/
+node_modules/
+.next/
+out/
 
 # Environment files
 .env
@@ -29,4 +29,9 @@ Thumbs.db
 
 # CDC event log (local demo artifact)
 cdc_events.jsonl
-frontend/.next
+
+# Claude
+.claude/
+
+# Streamlit
+.streamlit/
